@@ -8,6 +8,7 @@ const Config = struct {
     blacklist: []const []const u8,
     output_dir: []const u8,
     chunk_extension: []const u8,
+    chunk_size: u32,
 };
 
 const ChunkStore = std.HashMap([32]u8, // SHA-256 hash as key
@@ -27,10 +28,19 @@ const ChunkRef = struct {
     size: u32, // chunk size
 };
 
+// const ChunkSize = enum(i32) {
+//     KB = 1024,
+//     MB = 1024 * 1024,
+//     GB = 1024 * 1024 * 1024,
+// };
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // const chunk_size = ChunkSize.KB * 4;
+    const chunk_size = 1024 * 4;
 
     var config: Config = Config{
         // .root = "$HOME",
@@ -38,6 +48,7 @@ pub fn main() !void {
         .blacklist = &[_][]const u8{ "*.tmp", "node_modules", ".git", ".cache", ".npm" },
         .output_dir = "backup_chunks",
         .chunk_extension = ".chunk",
+        .chunk_size = chunk_size,
     };
 
     // Chunk store that stores chunks of files
@@ -98,7 +109,7 @@ pub fn main() !void {
             defer allocator.free(file_path);
 
             // Process the file into chunks
-            const file_node = try processFileIntoChunks(allocator, &chunk_store, file_path, entry.name);
+            const file_node = try processFileIntoChunks(allocator, &chunk_store, file_path, entry.name, config.chunk_size);
             try file_nodes.append(file_node);
         }
     }
@@ -151,7 +162,7 @@ pub fn main() !void {
 }
 
 // Process a file into chunks and store them in ChunkStore
-fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, file_path: []const u8, file_name: []const u8) !FileNode {
+fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, file_path: []const u8, file_name: []const u8, chunk_size: u32) !FileNode {
     // Open and read the file
     const file = try std.fs.openFileAbsolute(file_path, .{});
     defer file.close();
@@ -162,13 +173,12 @@ fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore,
     _ = try file.readAll(file_content);
 
     // Split file into chunks (4KB chunks - good balance for most use cases)
-    const CHUNK_SIZE = 4096;
     var chunks = std.ArrayList(ChunkRef).init(allocator);
     defer chunks.deinit();
 
     var offset: u64 = 0;
     while (offset < file_content.len) {
-        const chunk_end = @min(offset + CHUNK_SIZE, file_content.len);
+        const chunk_end = @min(offset + chunk_size, file_content.len);
         const chunk_data = file_content[offset..chunk_end];
 
         // Create SHA-256 hash for the chunk
@@ -178,6 +188,8 @@ fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore,
         // Store chunk only if it's new (deduplication)
         const chunk_existed = chunk_store.contains(hash);
         if (!chunk_existed) {
+            // TODO: Compress the chunk data before storing it
+
             const owned_chunk = try allocator.dupe(u8, chunk_data);
             try chunk_store.put(hash, owned_chunk);
             std.debug.print("  New chunk stored (offset {}, size {})\n", .{ offset, chunk_data.len });
@@ -260,6 +272,10 @@ pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     return result.toOwnedSlice();
 }
+
+// pub fn fastCDC() {
+
+// }
 
 // TODO: Implement S3 upload functionality
 // fn uploadChunkToS3(bucket: []const u8, hash: [32]u8, chunk_data: []const u8) !void {
