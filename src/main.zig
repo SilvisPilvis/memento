@@ -6,6 +6,8 @@ const fs = std.fs;
 const Config = struct {
     root: []const u8,
     blacklist: []const []const u8,
+    output_dir: []const u8,
+    chunk_extension: []const u8,
 };
 
 const ChunkStore = std.HashMap([32]u8, // SHA-256 hash as key
@@ -26,19 +28,38 @@ const ChunkRef = struct {
 };
 
 pub fn main() !void {
-    // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var env_map = try std.process.getEnvMap(gpa.allocator());
-    defer env_map.deinit();
-
     var config: Config = Config{
-        .root = "$HOME",
-        // .root = "/home/silvestrs",
+        // .root = "$HOME",
+        .root = "/home/silvestrs/Desktop/projects/zig-memento/backup",
         .blacklist = &[_][]const u8{ "*.tmp", "node_modules", ".git", ".cache", ".npm" },
+        .output_dir = "backup_chunks",
+        .chunk_extension = ".chunk",
     };
+
+    // Chunk store that stores chunks of files
+    var chunk_store = ChunkStore.init(allocator);
+    defer {
+        // Clean up allocated chunk data
+        var iterator = chunk_store.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.value_ptr.*);
+        }
+        chunk_store.deinit();
+    }
+
+    // Array to store file nodes
+    var file_nodes = std.ArrayList(FileNode).init(allocator);
+    defer {
+        for (file_nodes.items) |file_node| {
+            allocator.free(file_node.path);
+            allocator.free(file_node.chunks);
+        }
+        file_nodes.deinit();
+    }
 
     if (config.root.len == 0) {
         fatal("The backup root directory is not set", .{});
@@ -57,40 +78,131 @@ pub fn main() !void {
     var dir = try fs.cwd().openDir(config.root, .{ .iterate = true });
     defer dir.close();
 
+    // Walk through directories until there are no more directories
+    // 1. List dir
+    // 2. Backup files in current directory
+    // 3. Go deeper into the directory
+    // 4. Repeat
+
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
+        // Skip directories that are blacklisted
         if (entry.kind == .directory and !isBlacklisted(entry.name, config.blacklist)) {
             std.debug.print("{s} - {}\n", .{ entry.name, entry.kind });
+            // TODO: Recursively process subdirectories
+        } else if (entry.kind == .file and !isBlacklisted(entry.name, config.blacklist)) {
+            std.debug.print("Processing file: {s}\n", .{entry.name});
+
+            // Build full file path
+            const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.root, entry.name });
+            defer allocator.free(file_path);
+
+            // Process the file into chunks
+            const file_node = try processFileIntoChunks(allocator, &chunk_store, file_path, entry.name);
+            try file_nodes.append(file_node);
         }
     }
 
-    // Initialize client
-    // var client = try s3.S3Client.init(allocator, .{
-    //     .access_key_id = "your-key",
-    //     .secret_access_key = "your-secret",
-    //     .region = "us-east-1",
-    //     // Optional: Use with MinIO or other S3-compatible services
-    //     // .endpoint = "http://localhost:9000",
-    // });
-    // defer client.deinit();
-    //
-    // // Create bucket
-    // try client.createBucket("my-bucket");
-    //
-    // // Upload string to a file in bucket
-    // var uploader = client.uploader();
-    // try uploader.uploadString("my-bucket", "hello.txt", "Hello, S3!");
+    std.debug.print("\nBackup Summary:\n", .{});
+    std.debug.print("Files processed: {}\n", .{file_nodes.items.len});
+    std.debug.print("Unique chunks stored: {}\n", .{chunk_store.count()});
 
-    // Upload JSON data to bucket
-    // const data = .{ .name = "example", .value = 42 };
-    // try uploader.uploadJson("my-bucket", "data.json", data);
+    // Upload chunks to S3 (mock implementation for now)
+    std.debug.print("\nSaving chunks to disk...\n", .{});
 
-    // Upload file from file system to bucket
-    // try uploader.uploadFile("my-bucket", "backup.zst", "./archive.zst");
+    // Create the output directory if it doesn't exist
+    std.fs.cwd().makeDir(config.output_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {}, // Directory already exists, that's fine
+        else => return err,
+    };
+
+    //Make chunk_store into iterator
+    var chunk_iterator = chunk_store.iterator();
+    // Store number of uploaded chunks
+    var uploaded_count: u32 = 0;
+    // While there are more chunks to upload
+    while (chunk_iterator.next()) |entry| {
+        // Skip chunks that are already uploaded
+        if (entry.value_ptr.*.len == 0) continue;
+
+        // Hash the chunk key
+        const hash_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&entry.key_ptr.*)});
+        defer allocator.free(hash_hex);
+
+        // const tmp_chunk = hash_hex[0..8];
+        // std.debug.print("Writing chunk {s} (size: {} bytes)\n", .{ tmp_chunk, entry.value_ptr.*.len });
+
+        // We use {s} to format the chunk hash as a string
+        std.debug.print("Writing chunk {s} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
+
+        // Create full filepath with directory and filename
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ config.output_dir, hash_hex, config.chunk_extension });
+        defer allocator.free(file_path);
+
+        // Write chunk to file
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+        try file.writeAll(entry.value_ptr.*);
+
+        uploaded_count += 1;
+    }
+
+    std.debug.print("Write complete! {} chunks written to {s}/\n", .{ uploaded_count, config.output_dir });
 }
 
-/// This imports the separate module containing `root.zig`. Take a look in `build.zig` for details.
-const lib = @import("zig_memento_lib");
+// Process a file into chunks and store them in ChunkStore
+fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, file_path: []const u8, file_name: []const u8) !FileNode {
+    // Open and read the file
+    const file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const file_content = try allocator.alloc(u8, file_size);
+    defer allocator.free(file_content);
+    _ = try file.readAll(file_content);
+
+    // Split file into chunks (4KB chunks - good balance for most use cases)
+    const CHUNK_SIZE = 4096;
+    var chunks = std.ArrayList(ChunkRef).init(allocator);
+    defer chunks.deinit();
+
+    var offset: u64 = 0;
+    while (offset < file_content.len) {
+        const chunk_end = @min(offset + CHUNK_SIZE, file_content.len);
+        const chunk_data = file_content[offset..chunk_end];
+
+        // Create SHA-256 hash for the chunk
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(chunk_data, &hash, .{});
+
+        // Store chunk only if it's new (deduplication)
+        const chunk_existed = chunk_store.contains(hash);
+        if (!chunk_existed) {
+            const owned_chunk = try allocator.dupe(u8, chunk_data);
+            try chunk_store.put(hash, owned_chunk);
+            std.debug.print("  New chunk stored (offset {}, size {})\n", .{ offset, chunk_data.len });
+        } else {
+            std.debug.print("  Duplicate chunk found (offset {}, size {}) - skipped!\n", .{ offset, chunk_data.len });
+        }
+
+        // Create chunk reference for the file
+        try chunks.append(ChunkRef{
+            .hash = hash,
+            .offset = offset,
+            .size = @intCast(chunk_data.len),
+        });
+
+        offset = chunk_end;
+    }
+
+    // Return FileNode with all chunk references
+    return FileNode{
+        .path = try allocator.dupe(u8, file_name),
+        .chunks = try chunks.toOwnedSlice(),
+        .size = file_size,
+        .modified = std.time.timestamp(),
+    };
+}
 
 fn matchesPattern(name: []const u8, pattern: []const u8) bool {
     // Simple wildcard matching for *.extension
@@ -148,3 +260,10 @@ pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     return result.toOwnedSlice();
 }
+
+// TODO: Implement S3 upload functionality
+// fn uploadChunkToS3(bucket: []const u8, hash: [32]u8, chunk_data: []const u8) !void {
+//     // Initialize S3 client
+//     // Upload chunk with hash as key
+//     // Handle errors appropriately
+// }

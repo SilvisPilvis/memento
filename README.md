@@ -5,6 +5,25 @@ Instead of pure diffs, consider content-defined chunking:
 3. Compress chunks with zstd
 4. Store chunk references
 
+```zig
+const ChunkStore = std.HashMap([32]u8, // SHA-256 hash as key
+    []const u8, // chunk data as value
+    std.hash_map.AutoContext([32]u8), std.hash_map.default_max_load_percentage);
+
+const FileNode = struct {
+    path: []const u8,
+    chunks: []ChunkRef,
+    size: u64,
+    modified: i64,
+};
+
+const ChunkRef = struct {
+    hash: [32]u8,
+    offset: u64, // where in file this chunk starts
+    size: u32, // chunk size
+};
+```
+
 This gives you:
 
 Deduplication across ALL files automatically
