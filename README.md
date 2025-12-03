@@ -43,6 +43,20 @@ Want me to show you example code for content-defined chunking, or would you pref
 
 # TODO
 
+- [ ] Stream files in `processFileIntoChunks@172`
+- [ ] Save FileNode mappings to disk
+- [ ] Verify that chunks were written correctly
+- [ ] Verify that chunks were read correctly
+<!--- [ ] Verify checksums on restore-->
+- [ ] Implement incremental backups
+- [ ] Retry logic / error handling
+- [ ] Add recursive directory traversal
+- [ ] Add FastCDC chunking
+- [ ] File permissions / symlinks / special files
+- [ ] Add zstd compression
+- [ ] Add encryption
+- [ ] Add multi-threading / parallel processing
+
 Looking at your backup program, it has a solid foundation with content-defined chunking and deduplication, but there are several areas where it could be more efficient for a production backup system:
 Current Strengths:
 

@@ -161,6 +161,7 @@ pub fn main() !void {
     std.debug.print("Write complete! {} chunks written to {s}/\n", .{ uploaded_count, config.output_dir });
 }
 
+// TODO: Change from fixed size chunks to fastCDC
 // Process a file into chunks and store them in ChunkStore
 fn processFileIntoChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, file_path: []const u8, file_name: []const u8, chunk_size: u32) !FileNode {
     // Open and read the file
