@@ -11,12 +11,13 @@ const Config = struct {
     blacklist: []const []const u8,
     output_dir: []const u8,
     chunk_extension: []const u8,
-    chunk_size: u32,
+    repo_dir: []const u8,
+    index_file: []const u8,
 };
 
-const ChunkStore = std.HashMap([32]u8, // SHA-256 hash as key
+const ChunkStore = std.HashMap([16]u8, // SHA-256 hash as key
     []const u8, // chunk data as value
-    std.hash_map.AutoContext([32]u8), std.hash_map.default_max_load_percentage);
+    std.hash_map.AutoContext([16]u8), std.hash_map.default_max_load_percentage);
 
 const FileNode = struct {
     path: []const u8,
@@ -26,9 +27,20 @@ const FileNode = struct {
 };
 
 const ChunkRef = struct {
-    hash: [32]u8,
+    hash: [16]u8,
     offset: u64, // where in file this chunk starts
     size: u32, // chunk size
+};
+
+// Repository index to track which chunks exist
+const ChunkIndex = std.HashMap([16]u8, bool, std.hash_map.AutoContext([16]u8), std.hash_map.default_max_load_percentage);
+
+// Snapshot represents a backup at a point in time
+const Snapshot = struct {
+    timestamp: i64,
+    files: []FileNode,
+    total_size: u64,
+    unique_chunks: u32,
 };
 
 pub fn main() !void {
@@ -36,17 +48,22 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // const chunk_size = ChunkSize.KB * 4;
-    const chunk_size = 1024 * 8; // 8KB
-
     var config: Config = Config{
         // .root = "$HOME",
         .root = "/home/silvestrs/Desktop/projects/zig-memento/backup",
         .blacklist = &[_][]const u8{ "*.tmp", "node_modules", ".git", ".cache", ".npm" },
         .output_dir = "backup_chunks",
         .chunk_extension = ".chunk",
-        .chunk_size = chunk_size,
+        .repo_dir = "backup_repo",
+        .index_file = "chunk_index.json",
     };
+
+    // Initialize repository directories
+    try initializeRepository(config);
+
+    // Load existing chunk index for deduplication
+    var chunk_index = try loadChunkIndex(allocator, config);
+    defer chunk_index.deinit();
 
     // Chunk store that stores chunks of files
     var chunk_store = ChunkStore.init(allocator);
@@ -106,7 +123,7 @@ pub fn main() !void {
             defer allocator.free(file_path);
 
             // Process the file into chunks
-            const file_node = try processFileIntoChunks(allocator, &chunk_store, file_path, entry.name);
+            const file_node = try processFileIntoChunks(allocator, &chunk_store, &chunk_index, file_path, entry.name);
             try file_nodes.append(file_node);
         }
     }
@@ -118,11 +135,8 @@ pub fn main() !void {
     // Upload chunks to S3 (mock implementation for now)
     std.debug.print("\nSaving chunks to disk...\n", .{});
 
-    // Create the output directory if it doesn't exist
-    std.fs.cwd().makeDir(config.output_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {}, // Directory already exists, that's fine
-        else => return err,
-    };
+    // Save chunks to disk and update index
+    try saveNewChunks(allocator, &chunk_store, &chunk_index, config);
 
     //Make chunk_store into iterator
     var chunk_iterator = chunk_store.iterator();
@@ -161,6 +175,18 @@ pub fn main() !void {
     }
 
     std.debug.print("Write complete! {} chunks written to {s}/\n", .{ uploaded_count, config.output_dir });
+
+    // Save updated chunk index
+    try saveChunkIndex(allocator, &chunk_index, config);
+
+    // Create and save snapshot
+    const snapshot = Snapshot{
+        .timestamp = std.time.timestamp(),
+        .files = file_nodes.items,
+        .total_size = calculateTotalSize(file_nodes.items),
+        .unique_chunks = @intCast(chunk_index.count()),
+    };
+    try saveSnapshot(allocator, &snapshot, config);
 }
 
 // TODO: Change from fixed size chunks to fastCDC
@@ -169,6 +195,7 @@ pub fn main() !void {
 fn processFileIntoChunks(
     allocator: std.mem.Allocator,
     chunk_store: *ChunkStore,
+    chunk_index: *ChunkIndex,
     file_path: []const u8,
     file_name: []const u8,
     // _chunk_size: u32, // ignored – RamChunking drives the size
@@ -197,18 +224,31 @@ fn processFileIntoChunks(
         const cut = chunker.findCutpoint(remaining); // bytes to take this round
         const chunk_data = remaining[0..cut];
 
-        // SHA-256 of the *logical* chunk
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(chunk_data, &hash, .{});
+        // xxhash128 hash of the *logical* chunk
+        const digest = xxh.XxHash128.hash(chunk_data);
+        var hash: [16]u8 = undefined;
+        std.mem.writeInt(u64, hash[0..8], digest.lo, .little);
+        std.mem.writeInt(u64, hash[8..16], digest.hi, .little);
+        // Zero out the remaining 16 bytes to make it a full 32-byte array
+        // @memset(hash[16..32], 0);
+        // std.crypto.hash.sha2.Sha256.hash(chunk_data, &hash, .{});
 
-        // Deduplicate
-        const existed = chunk_store.contains(hash);
-        if (!existed) {
+        // Check if chunk already exists globally (from previous backups)
+        const existed_globally = chunk_index.contains(hash);
+        const existed_in_current = chunk_store.contains(hash);
+
+        if (!existed_globally and !existed_in_current) {
+            // Completely new chunk - store it and mark in index
             const owned = try allocator.dupe(u8, chunk_data);
             try chunk_store.put(hash, owned);
-            // std.debug.print("  New chunk stored (offset {}, size {})\n", .{ offset, chunk_data.len });
+            try chunk_index.put(hash, true);
+            std.debug.print("  New chunk stored (offset {}, size {})\n", .{ offset, chunk_data.len });
+        } else if (existed_globally and !existed_in_current) {
+            // Chunk exists from previous backup but not in current run
+            std.debug.print("  Existing chunk found (offset {}, size {}) – already backed up\n", .{ offset, chunk_data.len });
         } else {
-            // std.debug.print("  Duplicate chunk found (offset {}, size {}) – skipped!\n", .{ offset, chunk_data.len });
+            // Duplicate within current backup
+            std.debug.print("  Duplicate chunk found (offset {}, size {}) – skipped!\n", .{ offset, chunk_data.len });
         }
 
         try chunks.append(.{
@@ -285,30 +325,146 @@ pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return result.toOwnedSlice();
 }
 
-// pub const Progress = struct {
-//     current: u32,
-//     max: u32,
+// Initialize repository structure
+fn initializeRepository(config: Config) !void {
+    // Create repository directory
+    std.fs.cwd().makeDir(config.repo_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
-//     pub fn new(current: u32, max: u32) Progress {
-//         return Progress{ .current = current, .max = max };
-//     }
+    // Create chunks directory
+    std.fs.cwd().makeDir(config.output_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
 
-//     pub fn update(self: *Progress, current: u32) void {
-//         self.current = current;
-//     }
+// Load chunk index from disk
+fn loadChunkIndex(allocator: std.mem.Allocator, config: Config) !ChunkIndex {
+    var chunk_index = ChunkIndex.init(allocator);
 
-//     pub fn step(self: *Progress) void {
-//         if (self.current < self.max) {
-//             self.current += 1;
-//         } else {
-//             self.current = self.max;
-//         }
-//     }
+    const index_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.repo_dir, config.index_file });
+    defer allocator.free(index_path);
 
-//     pub fn finish(self: *Progress) void {
-//         self.current = self.max;
-//     }
-// };
+    const file = std.fs.cwd().openFile(index_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            std.debug.print("No existing chunk index found, starting fresh\n", .{});
+            return chunk_index;
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const content = try allocator.alloc(u8, file_size);
+    defer allocator.free(content);
+    _ = try file.readAll(content);
+
+    // Parse JSON and populate chunk_index
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    if (parsed.value.object.get("chunks")) |chunks_value| {
+        var chunks_iter = chunks_value.object.iterator();
+        while (chunks_iter.next()) |entry| {
+            var hash: [16]u8 = undefined;
+            _ = try std.fmt.hexToBytes(&hash, entry.key_ptr.*);
+            try chunk_index.put(hash, true);
+        }
+    }
+
+    std.debug.print("Loaded {} existing chunks from index\n", .{chunk_index.count()});
+    return chunk_index;
+}
+
+// Save chunk index to disk
+fn saveChunkIndex(allocator: std.mem.Allocator, chunk_index: *ChunkIndex, config: Config) !void {
+    const index_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.repo_dir, config.index_file });
+    defer allocator.free(index_path);
+
+    const file = try std.fs.cwd().createFile(index_path, .{});
+    defer file.close();
+
+    try file.writeAll("{\n  \"chunks\": {\n");
+
+    var iter = chunk_index.iterator();
+    var first = true;
+    while (iter.next()) |entry| {
+        if (!first) try file.writeAll(",\n");
+        first = false;
+
+        const hash_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&entry.key_ptr.*)});
+        defer allocator.free(hash_hex);
+
+        const line = try std.fmt.allocPrint(allocator, "    \"{s}\": true", .{hash_hex});
+        defer allocator.free(line);
+        try file.writeAll(line);
+    }
+
+    try file.writeAll("\n  }\n}\n");
+}
+
+// Save new chunks to disk
+fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_index: *ChunkIndex, config: Config) !void {
+    var chunk_iterator = chunk_store.iterator();
+    var saved_count: u32 = 0;
+
+    while (chunk_iterator.next()) |entry| {
+        const hash_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&entry.key_ptr.*)});
+        defer allocator.free(hash_hex);
+
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ config.output_dir, hash_hex, config.chunk_extension });
+        defer allocator.free(file_path);
+
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+        try file.writeAll(entry.value_ptr.*);
+
+        // Update chunk index to track this chunk
+        try chunk_index.put(entry.key_ptr.*, true);
+
+        saved_count += 1;
+        std.debug.print("Saved chunk {} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
+    }
+
+    std.debug.print("Saved {} new chunks to disk\n", .{saved_count});
+}
+
+// Save snapshot metadata
+fn saveSnapshot(allocator: std.mem.Allocator, snapshot: *const Snapshot, config: Config) !void {
+    const timestamp_str = try std.fmt.allocPrint(allocator, "{}", .{snapshot.timestamp});
+    defer allocator.free(timestamp_str);
+
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/snapshot_{s}.json", .{ config.repo_dir, timestamp_str });
+    defer allocator.free(snapshot_path);
+
+    const file = try std.fs.cwd().createFile(snapshot_path, .{});
+    defer file.close();
+
+    // Write snapshot as JSON (simplified version)
+    const snapshot_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "timestamp": {},
+        \\  "total_size": {},
+        \\  "unique_chunks": {},
+        \\  "file_count": {}
+        \\}}
+    , .{ snapshot.timestamp, snapshot.total_size, snapshot.unique_chunks, snapshot.files.len });
+    defer allocator.free(snapshot_json);
+
+    try file.writeAll(snapshot_json);
+    std.debug.print("Snapshot saved: {s}\n", .{snapshot_path});
+}
+
+// Calculate total size of all files
+fn calculateTotalSize(files: []const FileNode) u64 {
+    var total: u64 = 0;
+    for (files) |file| {
+        total += file.size;
+    }
+    return total;
+}
 
 // TODO: Implement S3 upload functionality
 // fn uploadChunkToS3(bucket: []const u8, hash: [32]u8, chunk_data: []const u8) !void {
