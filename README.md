@@ -5,6 +5,21 @@ Instead of pure diffs, consider content-defined chunking:
 3. Compress chunks with zstd
 4. Store chunk references
 
+```bash
+# No compression
+./zig_memento --no-compression
+./zig_memento --no-comp
+
+# With compression (specify level)
+./zig_memento 1          # Fast compression
+./zig_memento 14         # High compression  
+./zig_memento 22         # Maximum compression
+
+# Get help
+./zig_memento --help
+./zig_memento -h
+```
+
 ```zig
 const ChunkStore = std.HashMap([32]u8, // SHA-256 hash as key
     []const u8, // chunk data as value
