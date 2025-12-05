@@ -32,12 +32,13 @@ pub const ProgressBar = struct {
     }
 
     pub fn render(self: *ProgressBar) !void {
-        const stdout = std.io.getStdOut().writer();
+        var buffer: [1024]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(buffer[0..]);
 
         // Clear previous line
-        try stdout.print("\r", .{});
-        try self.printSpaces(stdout, self.last_output_len);
-        try stdout.print("\r", .{});
+        try stdout.interface.print("\r", .{});
+        try self.printSpaces(&stdout.interface, self.last_output_len);
+        try stdout.interface.print("\r", .{});
 
         const now = time.timestamp();
         const elapsed = now - self.start_time;
@@ -48,8 +49,8 @@ pub const ProgressBar = struct {
             0.0;
 
         // Parse schema and replace tokens
-        var output = std.ArrayList(u8).init(self.allocator);
-        defer output.deinit();
+        var output = std.ArrayList(u8).initCapacity(self.allocator, 0) catch unreachable;
+        defer output.deinit(self.allocator);
 
         var i: usize = 0;
         while (i < self.schema.len) {
@@ -67,53 +68,64 @@ pub const ProgressBar = struct {
                 if (std.mem.eql(u8, token, ":bar")) {
                     try self.renderBar(&output);
                 } else if (std.mem.eql(u8, token, ":current")) {
-                    // try output.print("{}", .{self.current});
-                    try output.writer().print("{}", .{self.current});
+                    const current_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.current});
+                    defer self.allocator.free(current_str);
+                    try output.appendSlice(self.allocator, current_str);
                 } else if (std.mem.eql(u8, token, ":total")) {
-                    try output.writer().print("{}", .{self.total});
+                    const total_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.total});
+                    defer self.allocator.free(total_str);
+                    try output.appendSlice(self.allocator, total_str);
                 } else if (std.mem.eql(u8, token, ":percent")) {
-                    try output.writer().print("{d:.1}", .{percent});
+                    const percent_str = try std.fmt.allocPrint(self.allocator, "{d:.1}", .{percent});
+                    defer self.allocator.free(percent_str);
+                    try output.appendSlice(self.allocator, percent_str);
                 } else if (std.mem.eql(u8, token, ":elapsed")) {
-                    try output.writer().print("{}s", .{elapsed});
+                    const elapsed_str = try std.fmt.allocPrint(self.allocator, "{d}s", .{elapsed});
+                    defer self.allocator.free(elapsed_str);
+                    try output.appendSlice(self.allocator, elapsed_str);
                 } else if (std.mem.eql(u8, token, ":eta")) {
                     const eta = if (self.current > 0 and self.current < self.total)
                         @divTrunc(elapsed * @as(i64, @intCast(self.total - self.current)), @as(i64, @intCast(self.current)))
                     else
                         0;
                     // try output.print("{}s", .{eta});
-                    try output.writer().print("{}s", .{eta});
+                    const eta_str = try std.fmt.allocPrint(self.allocator, "{d}s", .{eta});
+                    defer self.allocator.free(eta_str);
+                    try output.appendSlice(self.allocator, eta_str);
                 } else if (std.mem.eql(u8, token, ":filled")) {
                     try self.renderFilled(&output);
                 } else if (std.mem.eql(u8, token, ":blank")) {
                     try self.renderBlank(&output);
                 } else {
-                    try output.appendSlice(token);
+                    try output.appendSlice(self.allocator, token);
                 }
 
                 i = j;
             } else {
-                try output.append(self.schema[i]);
+                try output.append(self.allocator, self.schema[i]);
                 i += 1;
             }
         }
 
-        try stdout.print("{s}", .{output.items});
+        try stdout.interface.print("{s}", .{output.items});
         self.last_output_len = output.items.len;
 
         if (self.completed()) {
-            try stdout.print("\n", .{});
+            try stdout.interface.print("\n", .{});
+            try stdout.interface.flush();
             if (self.clean) {
-                try stdout.print("\r", .{});
-                try self.printSpaces(stdout, self.last_output_len);
-                try stdout.print("\r", .{});
+                try stdout.interface.print("\r", .{});
+                try self.printSpaces(&stdout.interface, self.last_output_len);
+                try stdout.interface.print("\r", .{});
             }
         }
     }
 
-    fn printSpaces(_: *ProgressBar, writer: anytype, count: usize) !void {
+    fn printSpaces(self: *ProgressBar, stdout: anytype, count: usize) !void {
+        _ = self;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            try writer.print(" ", .{});
+            try stdout.print(" ", .{});
         }
     }
 
@@ -129,7 +141,7 @@ pub const ProgressBar = struct {
             0;
 
         for (0..filled) |_| {
-            try output.appendSlice(self.filled_str);
+            try output.appendSlice(self.allocator, self.filled_str);
         }
     }
 
@@ -140,7 +152,7 @@ pub const ProgressBar = struct {
             0;
 
         for (filled..self.width) |_| {
-            try output.appendSlice(self.blank_str);
+            try output.appendSlice(self.allocator, self.blank_str);
         }
     }
 
@@ -216,7 +228,9 @@ pub fn main() !void {
             std.time.sleep(50 * std.time.ns_per_ms);
 
             if (i == 29) {
-                std.io.getStdOut().writer().print("\n", .{}) catch {};
+                var buffer: [64]u8 = undefined;
+                var stdout = std.fs.File.stdout().writer(buffer[0..]);
+                stdout.interface.print("\n", .{}) catch {};
             }
         }
     }

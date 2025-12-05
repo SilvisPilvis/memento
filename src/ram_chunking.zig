@@ -74,7 +74,9 @@ pub const RamChunking = struct {
         while (step <= num_vectors) {
             var i: usize = 0;
             while (i < num_vectors) : (i += step) {
-                self.avx256_array[i] = @max(self.avx256_array[i], self.avx256_array[i + half_step]);
+                if (i + half_step < num_vectors) {
+                    self.avx256_array[i] = @max(self.avx256_array[i], self.avx256_array[i + half_step]);
+                }
             }
             half_step = step;
             step = step << 1;

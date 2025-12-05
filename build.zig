@@ -33,6 +33,40 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    // Add a module from a local file
+    const ram_chunking_module = b.addModule("ram_chunking", .{
+        .root_source_file = b.path("src/ram_chunking.zig"),
+    });
+
+    exe.root_module.addImport("ram_chunking", ram_chunking_module);
+
+    const xxh = b.addModule("xxhash128", .{
+        .root_source_file = b.path("src/xxhash128.zig"),
+    });
+
+    exe.root_module.addImport("xxhash128", xxh);
+
+    const progress = b.addModule("progress", .{
+        .root_source_file = b.path("src/progress.zig"),
+    });
+
+    exe.root_module.addImport("progress", progress);
+
+    // Add zstd as a dependency. the string name must mach the dependency key in build.zig.zon
+    const zstd_dependency = b.dependency("zstd", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Link the static library to the executable
+    exe.linkLibrary(zstd_dependency.artifact("zstd"));
+
+    const zstd_module = b.addModule("zstd", .{
+        .root_source_file = b.path("src/zstd.zig"),
+    });
+
+    exe.root_module.addImport("zstd", zstd_module);
+
     // const aws_dep = b.dependency("aws", .{
     //     .target = target,
     //     .optimize = optimize,

@@ -36,20 +36,11 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // .aws = .{
-        //     .url = "https://git.lerch.org/lobo/aws-sdk-for-zig/archive/main.tar.gz",
-        //     .hash = "...", // Will be filled by zig fetch
-        // },
+        .zstd = .{
+            .url = "git+https://github.com/allyourcodebase/zstd.git?ref=1.5.7#01327d49cbc56dc24c20a167bb0055d7fc23de84",
+            .hash = "zstd-1.5.7-KEItkJ8vAAC5_rRlKmLflYQ-eKXbAIQBWZNmmJtS18q0",
+        },
     },
-
-    // Specifies the set of files and directories that are included in this package.
-    // Only files and directories listed here are included in the `hash` that
-    // is computed for this package. Only files listed here will remain on disk
-    // when using the zig package manager. As a rule of thumb, one should list
-    // files required for compilation plus any license(s).
-    // Paths are relative to the build root. Use the empty string (`""`) to refer to
-    // the build root itself.
-    // A directory listed here means that all files within, recursively, are included.
     .paths = .{
         "build.zig",
         "build.zig.zon",

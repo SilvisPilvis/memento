@@ -1,7 +1,10 @@
 .zig-cache/
 zig-out/
 *.o
+main
 
 # Testing files
 backup/*
 backup_chunks/*
+backup_chunks
+*.chunk

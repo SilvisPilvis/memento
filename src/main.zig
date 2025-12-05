@@ -5,6 +5,7 @@ const fs = std.fs;
 const ram = @import("ram_chunking.zig");
 const xxh = @import("xxhash128.zig");
 const progress = @import("progress.zig");
+const zstd = @import("zstd.zig");
 
 const Config = struct {
     root: []const u8,
@@ -13,6 +14,8 @@ const Config = struct {
     chunk_extension: []const u8,
     repo_dir: []const u8,
     index_file: []const u8,
+    compression_level: i32,
+    no_compression: bool,
 };
 
 const ChunkStore = std.HashMap([16]u8, // SHA-256 hash as key
@@ -48,6 +51,55 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Parse command line arguments
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var compression_level: i32 = 1; // Default compression level
+    var no_compression: bool = false;
+
+    // Parse command line arguments
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--no-compression") or std.mem.eql(u8, args[i], "--no-comp")) {
+            no_compression = true;
+            std.debug.print("Compression disabled\n", .{});
+        } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
+            std.debug.print("Usage: zig_memento [compression_level] [--no-compression]\n", .{});
+            std.debug.print("  compression_level: Integer from -131072 to 22 (default: 1)\n", .{});
+            std.debug.print("  --no-compression, --no-comp: Disable compression entirely\n", .{});
+            std.process.exit(0);
+        } else {
+            // Try to parse as compression level
+            compression_level = std.fmt.parseInt(i32, args[i], 10) catch |err| switch (err) {
+                error.InvalidCharacter => blk: {
+                    std.debug.print("Error: Invalid argument '{s}'. Use --help for usage.\n", .{args[i]});
+                    break :blk 1;
+                },
+                error.Overflow => blk: {
+                    std.debug.print("Error: Compression level '{s}' is too large. Using default level 1.\n", .{args[i]});
+                    break :blk 1;
+                },
+            };
+
+            // Clamp compression level to valid zstd range (-131072 to 22)
+            if (compression_level < -131072) {
+                std.debug.print("Warning: Compression level {} is too low, using -131072.\n", .{compression_level});
+                compression_level = -131072;
+            } else if (compression_level > 22) {
+                std.debug.print("Warning: Compression level {} is too high, using 22.\n", .{compression_level});
+                compression_level = 22;
+            }
+        }
+        i += 1;
+    }
+
+    if (no_compression) {
+        std.debug.print("Using no compression\n", .{});
+    } else {
+        std.debug.print("Using compression level: {}\n", .{compression_level});
+    }
+
     var config: Config = Config{
         // .root = "$HOME",
         .root = "/home/silvestrs/Desktop/projects/zig-memento/backup",
@@ -56,6 +108,8 @@ pub fn main() !void {
         .chunk_extension = ".chunk",
         .repo_dir = "backup_repo",
         .index_file = "chunk_index.json",
+        .compression_level = compression_level,
+        .no_compression = no_compression,
     };
 
     // Initialize repository directories
@@ -77,13 +131,13 @@ pub fn main() !void {
     }
 
     // Array to store file nodes
-    var file_nodes = std.ArrayList(FileNode).init(allocator);
+    var file_nodes = try std.ArrayList(FileNode).initCapacity(allocator, 0);
     defer {
         for (file_nodes.items) |file_node| {
             allocator.free(file_node.path);
             allocator.free(file_node.chunks);
         }
-        file_nodes.deinit();
+        file_nodes.deinit(allocator);
     }
 
     if (config.root.len == 0) {
@@ -113,7 +167,7 @@ pub fn main() !void {
     while (try iter.next()) |entry| {
         // Skip directories that are blacklisted
         if (entry.kind == .directory and !isBlacklisted(entry.name, config.blacklist)) {
-            std.debug.print("{s} - {}\n", .{ entry.name, entry.kind });
+            std.debug.print("{s} - {any}\n", .{ entry.name, entry.kind });
             // TODO: Recursively process subdirectories
         } else if (entry.kind == .file and !isBlacklisted(entry.name, config.blacklist)) {
             std.debug.print("Processing file: {s}\n", .{entry.name});
@@ -123,8 +177,8 @@ pub fn main() !void {
             defer allocator.free(file_path);
 
             // Process the file into chunks
-            const file_node = try processFileIntoChunks(allocator, &chunk_store, &chunk_index, file_path, entry.name);
-            try file_nodes.append(file_node);
+            const file_node = try processFileIntoChunks(allocator, &chunk_store, &chunk_index, file_path, entry.name, config);
+            try file_nodes.append(allocator, file_node);
         }
     }
 
@@ -198,6 +252,7 @@ fn processFileIntoChunks(
     chunk_index: *ChunkIndex,
     file_path: []const u8,
     file_name: []const u8,
+    config: Config,
     // _chunk_size: u32, // ignored – RamChunking drives the size
 ) !FileNode {
     // Open and read the whole file
@@ -215,8 +270,8 @@ fn processFileIntoChunks(
     defer chunker.deinit();
 
     // Build chunk list
-    var chunks = std.ArrayList(ChunkRef).init(allocator);
-    defer chunks.deinit();
+    var chunks = try std.ArrayList(ChunkRef).initCapacity(allocator, 0);
+    defer chunks.deinit(allocator);
 
     var offset: u64 = 0;
     while (offset < file_size) {
@@ -224,14 +279,17 @@ fn processFileIntoChunks(
         const cut = chunker.findCutpoint(remaining); // bytes to take this round
         const chunk_data = remaining[0..cut];
 
+        const final_chunk = if (config.no_compression) chunk_data else blk: {
+            const compressed_chunk = try zstd.compress(allocator, chunk_data, config.compression_level);
+            break :blk compressed_chunk;
+        };
+        defer if (!config.no_compression) allocator.free(final_chunk);
+
         // xxhash128 hash of the *logical* chunk
         const digest = xxh.XxHash128.hash(chunk_data);
         var hash: [16]u8 = undefined;
         std.mem.writeInt(u64, hash[0..8], digest.lo, .little);
         std.mem.writeInt(u64, hash[8..16], digest.hi, .little);
-        // Zero out the remaining 16 bytes to make it a full 32-byte array
-        // @memset(hash[16..32], 0);
-        // std.crypto.hash.sha2.Sha256.hash(chunk_data, &hash, .{});
 
         // Check if chunk already exists globally (from previous backups)
         const existed_globally = chunk_index.contains(hash);
@@ -239,10 +297,14 @@ fn processFileIntoChunks(
 
         if (!existed_globally and !existed_in_current) {
             // Completely new chunk - store it and mark in index
-            const owned = try allocator.dupe(u8, chunk_data);
+            const owned = try allocator.dupe(u8, final_chunk);
             try chunk_store.put(hash, owned);
             try chunk_index.put(hash, true);
-            std.debug.print("  New chunk stored (offset {}, size {})\n", .{ offset, chunk_data.len });
+            if (config.no_compression) {
+                std.debug.print("  New chunk stored (offset {}, size {}) - uncompressed\n", .{ offset, chunk_data.len });
+            } else {
+                std.debug.print("  New chunk stored (offset {}, size {}) - compressed from {} to {} bytes\n", .{ offset, chunk_data.len, chunk_data.len, final_chunk.len });
+            }
         } else if (existed_globally and !existed_in_current) {
             // Chunk exists from previous backup but not in current run
             std.debug.print("  Existing chunk found (offset {}, size {}) – already backed up\n", .{ offset, chunk_data.len });
@@ -251,7 +313,7 @@ fn processFileIntoChunks(
             std.debug.print("  Duplicate chunk found (offset {}, size {}) – skipped!\n", .{ offset, chunk_data.len });
         }
 
-        try chunks.append(.{
+        try chunks.append(allocator, .{
             .hash = hash,
             .offset = offset,
             .size = @intCast(chunk_data.len),
@@ -262,7 +324,7 @@ fn processFileIntoChunks(
 
     return FileNode{
         .path = try allocator.dupe(u8, file_name),
-        .chunks = try chunks.toOwnedSlice(),
+        .chunks = try chunks.toOwnedSlice(allocator),
         .size = file_size,
         .modified = std.time.timestamp(),
     };
@@ -293,8 +355,8 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    defer result.deinit();
+    var result = try std.ArrayList(u8).initCapacity(allocator, 0);
+    defer result.deinit(allocator);
 
     var i: usize = 0;
     while (i < path.len) {
@@ -310,19 +372,19 @@ pub fn expandPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
             // Get the environment variable
             if (std.posix.getenv(var_name)) |value| {
-                try result.appendSlice(value);
+                try result.appendSlice(allocator, value);
             } else {
                 // Variable not found, keep original
-                try result.append('$');
-                try result.appendSlice(var_name);
+                try result.append(allocator, '$');
+                try result.appendSlice(allocator, var_name);
             }
         } else {
-            try result.append(path[i]);
+            try result.append(allocator, path[i]);
             i += 1;
         }
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 // Initialize repository structure
@@ -394,7 +456,7 @@ fn saveChunkIndex(allocator: std.mem.Allocator, chunk_index: *ChunkIndex, config
         if (!first) try file.writeAll(",\n");
         first = false;
 
-        const hash_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&entry.key_ptr.*)});
+        const hash_hex = try std.fmt.allocPrint(allocator, "{x}", .{entry.key_ptr.*});
         defer allocator.free(hash_hex);
 
         const line = try std.fmt.allocPrint(allocator, "    \"{s}\": true", .{hash_hex});
@@ -411,7 +473,7 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
     var saved_count: u32 = 0;
 
     while (chunk_iterator.next()) |entry| {
-        const hash_hex = try std.fmt.allocPrint(allocator, "{}", .{std.fmt.fmtSliceHexLower(&entry.key_ptr.*)});
+        const hash_hex = try std.fmt.allocPrint(allocator, "{x}", .{entry.key_ptr.*});
         defer allocator.free(hash_hex);
 
         const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ config.output_dir, hash_hex, config.chunk_extension });
@@ -425,7 +487,7 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
         try chunk_index.put(entry.key_ptr.*, true);
 
         saved_count += 1;
-        std.debug.print("Saved chunk {} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
+        std.debug.print("Saved chunk {s} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
     }
 
     std.debug.print("Saved {} new chunks to disk\n", .{saved_count});
@@ -433,7 +495,7 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
 
 // Save snapshot metadata
 fn saveSnapshot(allocator: std.mem.Allocator, snapshot: *const Snapshot, config: Config) !void {
-    const timestamp_str = try std.fmt.allocPrint(allocator, "{}", .{snapshot.timestamp});
+    const timestamp_str = try std.fmt.allocPrint(allocator, "{d}", .{snapshot.timestamp});
     defer allocator.free(timestamp_str);
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/snapshot_{s}.json", .{ config.repo_dir, timestamp_str });
