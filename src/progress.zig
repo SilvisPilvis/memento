@@ -32,13 +32,12 @@ pub const ProgressBar = struct {
     }
 
     pub fn render(self: *ProgressBar) !void {
-        var buffer: [1024]u8 = undefined;
-        var stdout = std.fs.File.stdout().writer(buffer[0..]);
-
-        // Clear previous line
-        try stdout.interface.print("\r", .{});
-        try self.printSpaces(&stdout.interface, self.last_output_len);
-        try stdout.interface.print("\r", .{});
+        // Clear previous line and print progress
+        std.debug.print("\r", .{});
+        for (0..self.last_output_len) |_| {
+            std.debug.print(" ", .{});
+        }
+        std.debug.print("\r", .{});
 
         const now = time.timestamp();
         const elapsed = now - self.start_time;
@@ -107,16 +106,17 @@ pub const ProgressBar = struct {
             }
         }
 
-        try stdout.interface.print("{s}", .{output.items});
+        std.debug.print("{s}", .{output.items});
         self.last_output_len = output.items.len;
 
         if (self.completed()) {
-            try stdout.interface.print("\n", .{});
-            try stdout.interface.flush();
+            std.debug.print("\n", .{});
             if (self.clean) {
-                try stdout.interface.print("\r", .{});
-                try self.printSpaces(&stdout.interface, self.last_output_len);
-                try stdout.interface.print("\r", .{});
+                std.debug.print("\r", .{});
+                for (0..self.last_output_len) |_| {
+                    std.debug.print(" ", .{});
+                }
+                std.debug.print("\r", .{});
             }
         }
     }
@@ -161,10 +161,11 @@ pub const ProgressBar = struct {
     }
 
     pub fn clear(self: *ProgressBar) !void {
-        const stdout = std.io.getStdOut().writer();
-        try stdout.print("\r", .{});
-        try self.printSpaces(stdout, self.last_output_len);
-        try stdout.print("\r", .{});
+        std.debug.print("\r", .{});
+        for (0..self.last_output_len) |_| {
+            std.debug.print(" ", .{});
+        }
+        std.debug.print("\r", .{});
     }
 
     pub fn setFilledChar(self: *ProgressBar, char: []const u8) void {

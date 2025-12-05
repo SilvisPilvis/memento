@@ -170,7 +170,7 @@ pub fn main() !void {
             std.debug.print("{s} - {any}\n", .{ entry.name, entry.kind });
             // TODO: Recursively process subdirectories
         } else if (entry.kind == .file and !isBlacklisted(entry.name, config.blacklist)) {
-            std.debug.print("Processing file: {s}\n", .{entry.name});
+            // std.debug.print("Processing file: {s}\n", .{entry.name});
 
             // Build full file path
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.root, entry.name });
@@ -182,53 +182,15 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("\nBackup Summary:\n", .{});
-    std.debug.print("Files processed: {}\n", .{file_nodes.items.len});
-    std.debug.print("Unique chunks stored: {}\n", .{chunk_store.count()});
+    // std.debug.print("\nBackup Summary:\n", .{});
+    // std.debug.print("Files processed: {}\n", .{file_nodes.items.len});
+    // std.debug.print("Unique chunks stored: {}\n", .{chunk_store.count()});
 
     // Upload chunks to S3 (mock implementation for now)
     std.debug.print("\nSaving chunks to disk...\n", .{});
 
     // Save chunks to disk and update index
     try saveNewChunks(allocator, &chunk_store, &chunk_index, config);
-
-    //Make chunk_store into iterator
-    var chunk_iterator = chunk_store.iterator();
-    // Store number of uploaded chunks
-    var uploaded_count: u32 = 0;
-
-    var bar = try progress.ProgressBar.init(allocator, chunk_store.count());
-    bar.schema = "Backing up: [:bar] :percent% | :elapsed elapsed | ETA: :eta";
-    bar.width = 30;
-
-    // While there are more chunks to upload
-    while (chunk_iterator.next()) |entry| {
-        if (entry.value_ptr.*.len == 0) continue;
-
-        // 1. hash the chunk *data* with xxHash128
-        const digest = xxh.XxHash128.hash(entry.value_ptr.*); // key is the chunk bytes
-        // 2. turn the 128-bit value into a 32-char hex string
-        var hash_buf: [32]u8 = undefined;
-        const hash_hex = try std.fmt.bufPrint(&hash_buf, "{x:0>16}{x:0>16}", .{ digest.hi, digest.lo });
-        // 3. use first 16 hex chars for the file name (same as your old [0..8])
-        const file_name = hash_hex[0..16];
-
-        // std.debug.print("Writing chunk {s} (size: {} bytes)\n", .{ file_name, entry.value_ptr.*.len });
-
-        // build full path
-        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}{s}", .{ config.output_dir, file_name, config.chunk_extension });
-        defer allocator.free(file_path);
-
-        // write chunk
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-        try file.writeAll(entry.value_ptr.*);
-
-        uploaded_count += 1;
-        try bar.tick(1);
-    }
-
-    std.debug.print("Write complete! {} chunks written to {s}/\n", .{ uploaded_count, config.output_dir });
 
     // Save updated chunk index
     try saveChunkIndex(allocator, &chunk_index, config);
@@ -300,17 +262,17 @@ fn processFileIntoChunks(
             const owned = try allocator.dupe(u8, final_chunk);
             try chunk_store.put(hash, owned);
             try chunk_index.put(hash, true);
-            if (config.no_compression) {
-                std.debug.print("  New chunk stored (offset {}, size {}) - uncompressed\n", .{ offset, chunk_data.len });
-            } else {
-                std.debug.print("  New chunk stored (offset {}, size {}) - compressed from {} to {} bytes\n", .{ offset, chunk_data.len, chunk_data.len, final_chunk.len });
-            }
+            // if (config.no_compression) {
+            //     std.debug.print("  New chunk stored (offset {}, size {}) - uncompressed\n", .{ offset, chunk_data.len });
+            // } else {
+            //     std.debug.print("  New chunk stored (offset {}, size {}) - compressed from {} to {} bytes\n", .{ offset, chunk_data.len, chunk_data.len, final_chunk.len });
+            // }
         } else if (existed_globally and !existed_in_current) {
             // Chunk exists from previous backup but not in current run
-            std.debug.print("  Existing chunk found (offset {}, size {}) – already backed up\n", .{ offset, chunk_data.len });
+            // std.debug.print("  Existing chunk found (offset {}, size {}) – already backed up\n", .{ offset, chunk_data.len });
         } else {
             // Duplicate within current backup
-            std.debug.print("  Duplicate chunk found (offset {}, size {}) – skipped!\n", .{ offset, chunk_data.len });
+            // std.debug.print("  Duplicate chunk found (offset {}, size {}) – skipped!\n", .{ offset, chunk_data.len });
         }
 
         try chunks.append(allocator, .{
@@ -472,6 +434,11 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
     var chunk_iterator = chunk_store.iterator();
     var saved_count: u32 = 0;
 
+    // Initialize progress bar
+    var bar = try progress.ProgressBar.init(allocator, chunk_store.count());
+    bar.schema = "Saving chunks: [:bar] :percent% | :elapsed elapsed | ETA: :eta";
+    bar.width = 30;
+
     while (chunk_iterator.next()) |entry| {
         const hash_hex = try std.fmt.allocPrint(allocator, "{x}", .{entry.key_ptr.*});
         defer allocator.free(hash_hex);
@@ -487,10 +454,19 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
         try chunk_index.put(entry.key_ptr.*, true);
 
         saved_count += 1;
-        std.debug.print("Saved chunk {s} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
+
+        // Update the progress bar when a tenth of the chunks have been saved
+        const tenth = chunk_store.count() / 10;
+
+        if (saved_count % tenth == 0 or saved_count == chunk_store.count()) {
+            bar.current = saved_count;
+            try bar.render();
+        }
+
+        // std.debug.print("Saved chunk {s} (size: {} bytes)\n", .{ hash_hex[0..8], entry.value_ptr.*.len });
     }
 
-    std.debug.print("Saved {} new chunks to disk\n", .{saved_count});
+    std.debug.print("Write complete! {} chunks written to {s}/\n", .{ saved_count, config.output_dir });
 }
 
 // Save snapshot metadata
