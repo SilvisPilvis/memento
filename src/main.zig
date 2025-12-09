@@ -9,6 +9,7 @@ const zstd = @import("zstd.zig");
 
 const Config = struct {
     root: []const u8,
+    config_path: []const u8,
     blacklist: []const []const u8,
     output_dir: []const u8,
     chunk_extension: []const u8,
@@ -100,17 +101,32 @@ pub fn main() !void {
         std.debug.print("Using compression level: {}\n", .{compression_level});
     }
 
-    var config: Config = Config{
-        // .root = "$HOME",
-        .root = "/home/silvestrs/Desktop/projects/zig-memento/backup",
-        .blacklist = &[_][]const u8{ "*.tmp", "node_modules", ".git", ".cache", ".npm" },
-        .output_dir = "backup_chunks",
-        .chunk_extension = ".chunk",
-        .repo_dir = "backup_repo",
-        .index_file = "chunk_index.json",
-        .compression_level = compression_level,
-        .no_compression = no_compression,
-    };
+    var config: Config = undefined;
+
+    if (try configExists(allocator, "/home/silvestrs/Desktop/projects/zig-memento/config.json")) {
+        // Read the config to struct
+        std.debug.print("Config exists\n", .{});
+        config = try loadConfig(allocator, "/home/silvestrs/Desktop/projects/zig-memento/config.json");
+    } else {
+        // Create the config file with default values
+        std.debug.print("Config does not exist\n", .{});
+        config = Config{
+            // .root = "$HOME",
+            .root = "/home/silvestrs/Desktop/projects/zig-memento/backup",
+            .config_path = "/home/silvestrs/Desktop/projects/zig-memento",
+            // .config_path = "$HOME/.config/zig-memento/config.json",
+            .blacklist = &[_][]const u8{ "*.tmp", "node_modules", ".git", ".cache", ".npm" },
+            .output_dir = "backup_chunks",
+            .chunk_extension = ".chunk",
+            .repo_dir = "backup_repo",
+            .index_file = "chunk_index.json",
+            .compression_level = compression_level,
+            .no_compression = no_compression,
+        };
+        try saveConfig(allocator, config);
+    }
+
+    std.process.exit(0);
 
     // Initialize repository directories
     try initializeRepository(config);
@@ -480,18 +496,16 @@ fn saveSnapshot(allocator: std.mem.Allocator, snapshot: *const Snapshot, config:
     const file = try std.fs.cwd().createFile(snapshot_path, .{});
     defer file.close();
 
-    // Write snapshot as JSON (simplified version)
-    const snapshot_json = try std.fmt.allocPrint(allocator,
-        \\{{
-        \\  "timestamp": {},
-        \\  "total_size": {},
-        \\  "unique_chunks": {},
-        \\  "file_count": {}
-        \\}}
-    , .{ snapshot.timestamp, snapshot.total_size, snapshot.unique_chunks, snapshot.files.len });
-    defer allocator.free(snapshot_json);
+    // 1. Define a buffer for the file writer (e.g., 4096 bytes)
+    var buffer: [4096]u8 = undefined;
 
-    try file.writeAll(snapshot_json);
+    // 2. Pass the buffer to file.writer() and store the result (the writer struct)
+    var file_writer = file.writer(&buffer);
+
+    // 3. Use the `.interface` field to get the std.io.Writer
+    // Note: This also uses the modern `std.json.stringify` (your snippet was still using the deprecated `Stringify.value`).
+    try json.Stringify.value(snapshot, .{}, &file_writer.interface);
+
     std.debug.print("Snapshot saved: {s}\n", .{snapshot_path});
 }
 
@@ -502,6 +516,66 @@ fn calculateTotalSize(files: []const FileNode) u64 {
         total += file.size;
     }
     return total;
+}
+
+pub fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) !Config {
+    const file = try std.fs.cwd().openFile(config_path, .{});
+    defer file.close();
+
+    var buffer: [4096]u8 = undefined;
+    const reader = file.reader(&buffer);
+    const content = try reader.file.readAll(&buffer);
+
+    if (content == 0) {
+        return error.EmptyConfigFile;
+    }
+
+    const result = try json.parseFromSlice(Config, allocator, &buffer, .{});
+
+    return result.value;
+}
+
+pub fn saveConfig(allocator: std.mem.Allocator, config: Config) !void {
+    var expanded_path: ?[]u8 = null;
+    defer if (expanded_path) |path| allocator.free(path);
+    if (std.mem.containsAtLeast(u8, config.config_path, 1, "$")) {
+        expanded_path = try expandPath(allocator, config.config_path);
+        config.config_path = expanded_path.?;
+    }
+
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{config.config_path});
+    defer allocator.free(config_path);
+
+    const file = try std.fs.cwd().createFile(config_path, .{});
+    defer file.close();
+
+    var buffer: [4096]u8 = undefined;
+
+    const file_writer = file.writer(&buffer);
+
+    try json.Stringify.value(config, .{}, &file_writer.interface);
+
+    std.debug.print("Config saved: {s}\n", .{config_path});
+}
+
+pub fn configExists(allocator: std.mem.Allocator, config_path: []const u8) !bool {
+    var expanded_path: ?[]u8 = null;
+    defer if (expanded_path) |path| allocator.free(path);
+
+    // 1. Introduce a mutable local variable
+    var path_to_open: []const u8 = config_path;
+
+    if (std.mem.containsAtLeast(u8, path_to_open, 1, "$")) {
+        expanded_path = try expandPath(allocator, path_to_open);
+        // 2. Assign the new value to the mutable variable
+        path_to_open = expanded_path.?;
+    }
+
+    // 3. Use the mutable variable
+    const file = try std.fs.cwd().openFile(path_to_open, .{});
+    defer file.close();
+
+    return true;
 }
 
 // TODO: Implement S3 upload functionality
