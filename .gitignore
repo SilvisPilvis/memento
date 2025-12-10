@@ -7,4 +7,7 @@ main
 backup/*
 backup_chunks/*
 backup_chunks
+backup_repo/*
+backup_repo
 *.chunk
+config.json
