@@ -181,12 +181,12 @@ pub fn main() !void {
 
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        // Skip directories that are blacklisted
+        // If the entry is a directory and not blacklisted
         if (entry.kind == .directory and !isBlacklisted(entry.name, config.blacklist)) {
-            std.debug.print("{s} - {any}\n", .{ entry.name, entry.kind });
+            // std.debug.print("{s} - {any}\n", .{ entry.name, entry.kind });
             // TODO: Recursively process subdirectories
         } else if (entry.kind == .file and !isBlacklisted(entry.name, config.blacklist)) {
-            // std.debug.print("Processing file: {s}\n", .{entry.name});
+            std.debug.print("Processing file: {s}\n", .{entry.name});
 
             // Build full file path
             const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.root, entry.name });
@@ -659,6 +659,44 @@ fn arrayToJson(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
     try json_str.append(allocator, ']');
 
     return json_str.toOwnedSlice(allocator);
+}
+
+pub fn depthFirstProcess(allocator: std.mem.Allocator, config: Config) !void {
+    // Initialize directory iterator
+    var dir = try fs.cwd().openDir(config.root, .{ .iterate = true });
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        switch (entry.kind) {
+            .File => {
+                // Process file according to configuration
+                if (!isBlacklisted(entry.name, config.blacklist)) {
+                    // Build full file path
+                    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config.root, entry.name });
+                    defer allocator.free(file_path);
+
+                    // Process the file into chunks
+                    const file_node = try processFileIntoChunks(allocator, &chunk_store, &chunk_index, file_path, entry.name, config);
+                    try file_nodes.append(allocator, file_node);
+                }
+            },
+            .Directory => {
+                // Process directory according to configuration
+                if (!isBlacklisted(entry.name, config.blacklist)) {
+                    try depthFirstProcess(allocator, entry.name);
+                }
+            },
+            .Symlink => {
+                // Process symlink according to configuration
+                break;
+            },
+            .Unknown => {
+                // Process unknown entry according to configuration
+                break;
+            },
+        }
+    }
 }
 
 // TODO: Implement S3 upload functionality
