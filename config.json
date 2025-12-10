@@ -1,0 +1,11 @@
+{
+  "root": "/home/silvestrs/Desktop/projects/zig-memento/backup",
+  "config_path": "/home/silvestrs/Desktop/projects/zig-memento",
+  "blacklist": ["*.tmp", "node_modules", ".git", ".cache", ".npm"],
+  "output_dir": "backup_chunks",
+  "chunk_extension": ".chunk",
+  "repo_dir": "backup_repo",
+  "index_file": "chunk_index.json",
+  "compression_level": 1,
+  "no_compression": false
+}

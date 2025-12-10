@@ -5,7 +5,7 @@ pub const ProgressBar = struct {
     allocator: std.mem.Allocator,
     total: usize,
     current: usize = 0,
-    width: usize = 60,
+    width: usize = 20,
     filled_str: []const u8 = "█",
     blank_str: []const u8 = "-",
     schema: []const u8 = " [:bar] :current/:total :percent% :elapsed",
@@ -79,7 +79,7 @@ pub const ProgressBar = struct {
                     defer self.allocator.free(percent_str);
                     try output.appendSlice(self.allocator, percent_str);
                 } else if (std.mem.eql(u8, token, ":elapsed")) {
-                    const elapsed_str = try std.fmt.allocPrint(self.allocator, "{d}s", .{elapsed});
+                    const elapsed_str = try std.fmt.allocPrint(self.allocator, "{d}s", .{@min(elapsed, 999)});
                     defer self.allocator.free(elapsed_str);
                     try output.appendSlice(self.allocator, elapsed_str);
                 } else if (std.mem.eql(u8, token, ":eta")) {

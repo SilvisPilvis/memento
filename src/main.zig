@@ -105,8 +105,8 @@ pub fn main() !void {
 
     if (try configExists(allocator, "/home/silvestrs/Desktop/projects/zig-memento/config.json")) {
         // Read the config to struct
-        std.debug.print("Config exists\n", .{});
         config = try loadConfig(allocator, "/home/silvestrs/Desktop/projects/zig-memento/config.json");
+        std.debug.print("Config exists\n Repo dir: {s}\n", .{config.repo_dir});
     } else {
         // Create the config file with default values
         std.debug.print("Config does not exist\n", .{});
@@ -126,7 +126,7 @@ pub fn main() !void {
         try saveConfig(allocator, config);
     }
 
-    std.process.exit(0);
+    // std.process.exit(0);
 
     // Initialize repository directories
     try initializeRepository(config);
@@ -453,7 +453,7 @@ fn saveNewChunks(allocator: std.mem.Allocator, chunk_store: *ChunkStore, chunk_i
     // Initialize progress bar
     var bar = try progress.ProgressBar.init(allocator, chunk_store.count());
     bar.schema = "Saving chunks: [:bar] :percent% | :elapsed elapsed | ETA: :eta";
-    bar.width = 30;
+    // bar.width = 20;
 
     while (chunk_iterator.next()) |entry| {
         const hash_hex = try std.fmt.allocPrint(allocator, "{x}", .{entry.key_ptr.*});
@@ -522,38 +522,102 @@ pub fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) !Config
     const file = try std.fs.cwd().openFile(config_path, .{});
     defer file.close();
 
-    var buffer: [4096]u8 = undefined;
-    const reader = file.reader(&buffer);
-    const content = try reader.file.readAll(&buffer);
+    const file_size = try file.getEndPos();
+    const contents = try allocator.alloc(u8, file_size);
+    // keep the buffer alive for the whole lifetime of the Config
+    defer allocator.free(contents);
 
-    if (content == 0) {
-        return error.EmptyConfigFile;
-    }
+    _ = try file.readAll(contents);
+    if (contents.len == 0) return error.EmptyConfigFile;
 
-    const result = try json.parseFromSlice(Config, allocator, &buffer, .{});
-
-    return result.value;
+    // tell the parser to allocate every string/array into the same allocator
+    const parsed = try std.json.parseFromSlice(
+        Config,
+        allocator,
+        contents,
+        .{ .allocate = .alloc_always },
+    );
+    // parsed.value is the Config; parsed.arena owns the memory
+    errdefer parsed.deinit();
+    return parsed.value;
 }
 
-pub fn saveConfig(allocator: std.mem.Allocator, config: Config) !void {
+// pub fn loadConfig(allocator: std.mem.Allocator, config_path: []const u8) !Config {
+//     const file = try std.fs.cwd().openFile(config_path, .{});
+//     defer file.close();
+
+//     const file_size = try file.getEndPos();
+//     const contents = try allocator.alloc(u8, file_size);
+//     defer allocator.free(contents);
+
+//     _ = try file.readAll(contents);
+
+//     if (contents.len == 0) {
+//         return error.EmptyConfigFile;
+//     }
+
+//     const result = try json.parseFromSlice(Config, allocator, contents, .{});
+//     defer result.deinit();
+
+//     return result.value;
+// }
+
+pub fn saveConfig(allocator: std.mem.Allocator, config_param: Config) !void {
+    var config = config_param;
+
+    // Expand envriornment variables if availible
     var expanded_path: ?[]u8 = null;
-    defer if (expanded_path) |path| allocator.free(path);
-    if (std.mem.containsAtLeast(u8, config.config_path, 1, "$")) {
+    defer if (expanded_path) |p| allocator.free(p);
+
+    if (std.mem.indexOf(u8, config.config_path, "$") != null) {
         expanded_path = try expandPath(allocator, config.config_path);
         config.config_path = expanded_path.?;
     }
 
-    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{config.config_path});
+    // 1. Create the full config file path (similar to snapshot_path)
+    const config_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/config.json",
+        .{config.config_path},
+    );
     defer allocator.free(config_path);
 
+    // Convert blacklist to JSON
+    const blacklist_json = try arrayToJson(allocator, config.blacklist);
+    defer allocator.free(blacklist_json);
+
+    // 2. Open the file
     const file = try std.fs.cwd().createFile(config_path, .{});
     defer file.close();
 
-    var buffer: [4096]u8 = undefined;
+    // Write the config JSON to the file
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "root": "{s}",
+        \\  "config_path": "{s}",
+        \\  "blacklist": {s},
+        \\  "output_dir": "{s}",
+        \\  "chunk_extension": "{s}",
+        \\  "repo_dir": "{s}",
+        \\  "index_file": "{s}",
+        \\  "compression_level": {},
+        \\  "no_compression": {}
+        \\}}
+    , .{
+        config.root,
+        config.config_path,
+        blacklist_json,
+        config.output_dir,
+        config.chunk_extension,
+        config.repo_dir,
+        config.index_file,
+        config.compression_level,
+        config.no_compression,
+    });
+    defer allocator.free(config_json);
 
-    const file_writer = file.writer(&buffer);
-
-    try json.Stringify.value(config, .{}, &file_writer.interface);
+    // 4. Write the entire JSON string to the file
+    try file.writeAll(config_json);
 
     std.debug.print("Config saved: {s}\n", .{config_path});
 }
@@ -571,11 +635,30 @@ pub fn configExists(allocator: std.mem.Allocator, config_path: []const u8) !bool
         path_to_open = expanded_path.?;
     }
 
-    // 3. Use the mutable variable
-    const file = try std.fs.cwd().openFile(path_to_open, .{});
+    // 3. Use the mutable variable - catch file access errors
+    const file = std.fs.cwd().openFile(path_to_open, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.AccessDenied, error.IsDir => return false,
+        else => return err,
+    };
     defer file.close();
 
     return true;
+}
+
+fn arrayToJson(allocator: std.mem.Allocator, array: []const []const u8) ![]u8 {
+    var json_str = try std.ArrayList(u8).initCapacity(allocator, 0);
+    defer json_str.deinit(allocator);
+
+    try json_str.append(allocator, '[');
+    for (array, 0..) |item, i| {
+        if (i > 0) try json_str.appendSlice(allocator, ", ");
+        try json_str.appendSlice(allocator, "\"");
+        try json_str.appendSlice(allocator, item);
+        try json_str.appendSlice(allocator, "\"");
+    }
+    try json_str.append(allocator, ']');
+
+    return json_str.toOwnedSlice(allocator);
 }
 
 // TODO: Implement S3 upload functionality
